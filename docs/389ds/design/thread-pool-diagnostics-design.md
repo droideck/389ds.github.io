@@ -25,13 +25,71 @@ Design
 
 ### The status file
 
-At startup, ns-slapd creates slapd-INSTANCE.threadpool in the server run directory (for example /run/dirsrv/slapd-localhost.threadpool). The file starts with a 4KB header followed by one 64 byte slot per worker thread. The layout is defined in ldap/servers/slapd/threadpool_stats.h, and the lib389 reader mirrors the same field list.
+At startup, ns-slapd creates the slapd-INSTANCE.monitor directory in the server run directory, with the status file threadpool inside it (for example /run/dirsrv/slapd-localhost.monitor/threadpool). The file starts with a 4KB header followed by one 64 byte slot per worker thread. The layout is defined in ldap/servers/slapd/threadpool_stats.h, and the lib389 reader mirrors the same field list.
 
-The header contains a magic value, the format version, the sizes the reader needs to validate the file, the server pid and start time, a heartbeat timestamp, and the pool gauges: current and maximum busy workers, current and maximum work queue size, operations initiated and completed, and current connections.
+The header is one 4KB page:
 
-Each worker slot contains the worker state (idle, busy, exited), the operation type, the connection id, the operation id, and the start time of the current operation.
+```
+typedef struct tp_stats_header {
+    uint64_t magic;
+    uint16_t ver_major;
+    uint16_t ver_minor;
+    uint32_t header_size;
+    uint32_t worker_slot_size;
+    uint32_t max_workers;
+    uint64_t server_pid;
+    uint64_t start_wall_sec;
+    uint64_t heartbeat_mono_ns;
+    uint64_t heartbeat_wall_sec;
+    uint32_t shutdown_clean;
+    uint32_t pad0;
+    uint64_t cur_work_queue;
+    uint64_t max_work_queue;
+    uint64_t cur_busy_workers;
+    uint64_t max_busy_workers;
+    uint64_t ops_initiated;
+    uint64_t ops_completed;
+    uint64_t cur_connections;
+    uint8_t reserved[3976];
+} tp_stats_header_t;
+```
+
+- magic - "TPOOLST1", written last during initialization
+- ver_major, ver_minor - format version, see Format versioning below
+- header_size, worker_slot_size - the reader validates these and uses them for all offsets, instead of its own compiled-in constants
+- max_workers - number of worker slots that follow the header
+- server_pid, start_wall_sec - identity of the writing server
+- heartbeat_mono_ns, heartbeat_wall_sec - liveness signal, updated every second
+- shutdown_clean - set during clean shutdown before the unlink; a leftover file with this flag unset came from a crash
+- cur_work_queue ... cur_connections - the pool gauges: current and maximum work queue size, current and maximum busy workers, operations initiated and completed, and current connections
+- reserved - pads the header to one page
+
+Each worker slot is one cache line:
+
+```
+typedef struct __attribute__((aligned(64))) tp_worker_slot {
+    uint32_t state;
+    uint32_t op_tag;
+    uint64_t conn_id;
+    uint64_t op_id;
+    uint64_t start_ns;
+} tp_worker_slot_t;
+```
+
+- state - unused, idle, busy or exited
+- op_tag - the LDAP request tag of the operation being processed (bind, search, modify, ...)
+- conn_id, op_id - the connection and operation the worker is serving
+- start_ns - CLOCK_MONOTONIC start time of the current operation; nonzero means an operation is in flight (op_id cannot serve as that flag, because 0 is a valid operation id)
+
+The alignment pads the slot to 64 bytes, so each worker writes into its own cache line. Both sizes are locked with _Static_assert in threadpool_stats.h.
 
 The file is only meant to be read on the machine it was written on. All values are fixed width host-endian integers. It contains no DNs, filters, IP addresses or any other request content, only operation metadata.
+
+### Format versioning
+
+The header starts with the magic value and a major and minor format version, followed by the header size and the slot size. dsctl validates all of them before parsing anything, so a file it does not fully understand is refused with an unsupported-version error rather than misread. The major version governs compatibility; the minor version identifies the revision.
+
+The file itself never needs migration, because it is created at startup and removed on clean shutdown. Version skew is still possible: the package can be upgraded while the old server keeps running, and a preserved crash file from an older server can be read later with --file. When the format changes, the major version is bumped. An older dsctl then refuses the newer file with a clear error, and a newer dsctl keeps the parser for the earlier major versions, so live files and crash archives written by older servers stay readable.
 
 ### Writing the data
 
@@ -39,9 +97,9 @@ The pool gauges already exist as internal counters. Once per second, a callback 
 
 The worker slots are updated by the workers themselves, with atomic stores, at the same places in connection.c where the busy worker counters are maintained. The start time field also serves as the "operation in flight" flag, because operation id 0 is a valid value (the first operation on a connection).
 
-The magic value is written last during initialization, so the reader never sees a half initialized file. On clean shutdown the file is removed. After a crash or kill the file stays behind, and the next startup preserves it instead of overwriting it: the leftover is renamed to slapd-INSTANCE.threadpool.YYYYMMDD-HHMMSS (the same naming the log rotation uses) and the five newest archives are kept. Only a leftover from an unclean shutdown is preserved, and there is no configuration option for this. If the file cannot be preserved, it is removed as before.
+The magic value is written last during initialization, so the reader never sees a half initialized file. On clean shutdown the file is removed; the monitor directory stays. After a crash or kill the file stays behind, and the next startup preserves it instead of overwriting it: the leftover is renamed to threadpool.YYYYMMDD-HHMMSS in the same directory (the same naming the log rotation uses) and the five newest archives are kept. Only a leftover from an unclean shutdown is preserved, and there is no configuration option for this. If the file cannot be preserved, it is removed as before.
 
-The run directory is writable by the service user, so the file is created carefully. Any stale file at the path is removed first, the file is opened with O_EXCL and O_NOFOLLOW and mode 0640, and the result is verified to be a regular file owned by the server. If any of this fails (for example SELinux denies removing a symlink someone planted at the path), the feature is disabled with a warning in the errors log and the server starts normally without it. The disk space for the file is reserved up front, so a full filesystem cannot crash the server later when a worker writes into an unbacked page.
+The run directory is writable by the service user, so both the directory and the file are created carefully. The monitor directory is created with mode 0750 and, when it already exists, it must be a real directory owned by the server. Any stale file at the file path is removed first, the file is opened with O_EXCL and O_NOFOLLOW and mode 0640, and the result is verified to be a regular file owned by the server. If any of this fails (for example SELinux denies removing a symlink someone planted at the path), the feature is disabled with a warning in the errors log and the server starts normally without it. The disk space for the file is reserved up front, so a full filesystem cannot crash the server later when a worker writes into an unbacked page.
 
 ### Reading the data
 
@@ -54,7 +112,7 @@ When the file does not exist, dsctl explains why: the instance is not running (t
 A preserved crash file can be read with the --file option, and the same pid and heartbeat warnings apply to it. When crash archives exist, the normal status output points at the newest one:
 
 ```
-dsctl localhost thread-pool status --file /run/dirsrv/slapd-localhost.threadpool.20260707-153042
+dsctl localhost thread-pool status --file /run/dirsrv/slapd-localhost.monitor/threadpool.20260707-153042
 ```
 
 ### cn=monitor
@@ -70,12 +128,14 @@ threadpoolworker: worker=4 state=busy op=add duration_ns=16733782
 
 cn=monitor is readable by anonymous users in default deployments, so these values only contain the state, the operation type and the duration. The connection and operation ids are only available through dsctl.
 
+The values are space separated key=value tokens, and later versions may append new tokens, so consumers should parse them by name rather than by position or count.
+
 Usage
 -----
 
 ```
 Instance: standalone1
-Path: /run/dirsrv/slapd-standalone1.threadpool
+Path: /run/dirsrv/slapd-standalone1.monitor/threadpool
 PID: 64442
 Uptime: 57.000s
 Heartbeat age: 0.737s
@@ -100,7 +160,7 @@ The feature is enabled by default. One new cn=config attribute controls it:
 nsslapd-thread-pool-stats: on\|off (on by default)
 ```
 
-A restart is required for a change to take effect, because the value is read once when the file is created at startup.
+A restart is required for a change to take effect, because the value is read once when the file is created at startup. An online change is accepted, and the server notes in the operation result and the errors log that a restart is required. dsctl thread-pool status also warns when the running state does not match the configured value.
 
 There is no sizing option. The file size follows nsslapd-threadnumber: a 4KB header plus 64 bytes per worker, which is around 6KB for a 32 thread server.
 
