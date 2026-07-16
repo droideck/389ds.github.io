@@ -101,6 +101,8 @@ The magic value is written last during initialization, so the reader never sees 
 
 The run directory is writable by the service user, so both the directory and the file are created carefully. The monitor directory is created with mode 0750 and, when it already exists, it must be a real directory owned by the server. Any stale file at the file path is removed first, the file is opened with O_EXCL and O_NOFOLLOW and mode 0640, and the result is verified to be a regular file owned by the server. If any of this fails (for example SELinux denies removing a symlink someone planted at the path), the feature is disabled with a warning in the errors log and the server starts normally without it. The disk space for the file is reserved up front, so a full filesystem cannot crash the server later when a worker writes into an unbacked page.
 
+No selinux-policy change is needed for the new directory. The run directory is labeled dirsrv\_var\_run\_t, the monitor directory and status file created inside it inherit that label, and the existing policy already allows ns-slapd to manage directories and files of that type. The dirsrv file context pattern also covers the new path, so a relabel keeps the label correct. If a policy denial does occur anyway, it lands in one of the failure paths above: the feature is disabled with a warning and the server starts normally.
+
 ### Reading the data
 
 dsctl finds the file through nsslapd-rundir in the instance dse.ldif, maps it read only, and validates the magic, version, header size, slot size and worker count before parsing anything. A file that fails validation is refused. The file mode is 0640, so the command must run as root or as a member of the server's group.
